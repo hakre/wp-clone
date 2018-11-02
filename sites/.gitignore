@@ -1,0 +1,8 @@
+#
+# /sites     the standard folder to clone sites into, that is
+#            one site into one subdirectory.
+#
+
+# ignore all subdirectories
+/*/*
+!/example/*

@@ -1,0 +1,367 @@
+#!/bin/bash
+#
+# clone a wordpress website
+#
+# usage: wp-clone --help
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+err_report() { echo "Error on line $1"; }
+trap 'err_report $LINENO' ERR
+
+# wordpress config (define) setting
+wpc() {
+  sed -n "s/.*${1}.*, '\(.*\)');.*/\1/p" "${target}/.wp-sandbox/wp-config.php"
+}
+
+# wordpress config database table prefix
+wpc_prefix() {
+  local prefix;
+  # shellcheck disable=SC2016
+  prefix="$(sed -n -e 's/^.*\$table_prefix *= *["'\'']\(.*\)["'\''] *;.*$/\1/p' \
+    "${target}/.wp-sandbox/wp-config.php")"
+  echo "${prefix-wp_}"
+}
+
+# wordpress option setting from database
+wpc_dcdb() {
+  local option="${1}"
+  dc exec -T -eMYSQL_PWD="$(wpc DB_PASSWORD)" db \
+    mysql -hdb -u"$(wpc DB_USER)" -D"${db_name}"  -sNr -e \
+    'SELECT option_value FROM '"${db_prefix}"'options WHERE option_name = "'"${option}"'" LIMIT 1'
+}
+
+# rsync progress for the shell (keeps transfer info at the end)
+rsync_progress() {
+  local line
+  local buffer=""
+  local buffer_ex=""
+  local count=0
+  while IFS= read -r line; do
+    if [ ! -z "${buffer}" ]; then
+      if [ ${count} -eq 0 ]; then
+        : echo
+      else
+        echo -n $'\rrsync: '"[$count] "
+        # shellcheck disable=2046
+        printf ' %.0s' $(seq  -f "%' 0.0f" ${#buffer});
+        echo -n $'\rrsync: '"[$count] "
+      fi
+    fi
+    echo -n "${line}"
+    buffer_ex="${buffer}"
+    buffer="${line}"
+    let count++ || true
+  done < /dev/stdin
+  echo "${buffer_ex} - done."
+}
+
+#
+
+ssh_init() {
+  echo "obtaining wp configuration from ${source_host}..."
+  scp -B "${source_host}:${source_path}/wp-config.php" "${target}/.wp-sandbox/" >/dev/null
+}
+
+# init target directory (.wp-sandbox directory)
+init_target() {
+  local dir="${1}/.wp-sandbox"
+  mkdir -p "${dir}"
+  cp lib/extra-config.php "${dir}/"
+  cp lib/index.php "${dir}/"
+
+  echo "# wp-clone resource
+readonly source=\"${source}\"" > "${dir}/wp_clone_rc"
+}
+
+# rsync files from remote host to site directory
+rsync_target() {
+  rsync -rav -e ssh "${source_host}:${source_path}/" "${target}/" \
+    | rsync_progress
+}
+
+# execute a bash script via ssh
+ssh_bash() {
+  local bash_script
+  readonly bash_script="${1}"
+  shift
+  # shellcheck disable=SC2029
+  ssh "${source_host}" -- /bin/bash -s - "${@}" < "${bash_script}"
+}
+
+# remote mysql dump and transferal of the file to site directory
+ssh_mysql_dump() {
+  readonly dump_path="$(ssh_bash lib/sb-db-dump.sh "${source_path}")"
+  readonly dump_file="$(basename "${dump_path}")"
+  scp -B "${source_host}:${dump_path}/" "${target}/.wp-sandbox/" >/dev/null
+}
+
+# tailor docker-compose.yml from template
+dc_init() {
+  sed -e 's/"8000:80"/"80:80"/;s/MYSQL_DATABASE: wordpress/MYSQL_DATABASE: '"${db_name}"'/' \
+    -e 's/MYSQL_USER: wordpress/MYSQL_USER: '"$(wpc DB_USER)"'/' \
+    -e 's/MYSQL_PASSWORD: wordpress/MYSQL_PASSWORD: '"$(wpc DB_PASSWORD)"'/' \
+    -e 's/WORDPRESS_DB_NAME: wordpress/WORDPRESS_DB_NAME: '"${db_name}"'/' \
+    -e 's/WORDPRESS_DB_USER: wordpress/WORDPRESS_DB_USER: '"$(wpc DB_USER)"'/' \
+    -e 's/WORDPRESS_DB_PASSWORD: wordpress/WORDPRESS_DB_PASSWORD: '"$(wpc DB_PASSWORD)"'/' \
+    lib/docker-compose.yml \
+    > "${target}/docker-compose.yml"
+}
+
+# docker compose command in project
+dc() {
+  lib/run-docker-compose.sh -f "${target}/docker-compose.yml" "$@"
+}
+
+# import database dump into "db" container
+import_dump() {
+  echo "importing mysql dump..."
+  <"${target}/.wp-sandbox/${db_name}.sql.gz" gunzip \
+    | dc run --rm -e "MYSQL_PWD=${mysql_root_pw}" db \
+      mysql -hdb -uroot -D"${db_name}"
+}
+
+# wait for mysql availability (docker compose service)
+dc_mysql_wait() {
+  local service="${1}" name tmpfile
+  # availability check via docker exec as docker compose exec has not proven
+  # reliable enough here
+  name=$(docker ps -fid="$(dc ps -q "${service}")" --format "{{.Names}}")
+  tmpfile=$(mktemp /tmp/.wp-sandbox.XXXXXX)
+
+  local count=0
+  printf "%2d: " 1 > "${tmpfile}"
+  while ! docker exec -e "MYSQL_PWD=${mysql_root_pw}" "${name}" \
+      mysql -hdb -uroot -e status >/dev/null 2>>"${tmpfile}" ; do
+    if [ ${count} -eq 0 ]; then
+      echo -n "Waiting for database connection..."
+    elif [ ${count} -lt 10 ]; then
+      echo -n "."
+    else
+      echo " giving up:"
+      cat "${tmpfile}"
+      break;
+    fi
+    sleep $(( 1 + count / 2 ))
+    (( ++count ))
+    printf "%2d: " "$(( count + 1 ))" >> "${tmpfile}"
+  done
+  [ ${count} -ne 0 ] && [ ${count} -lt 10 ] && echo " ok."
+
+  rm "$tmpfile"
+
+  if [ ${count} -gt 9 ]; then
+    exit 1
+  fi
+}
+
+# verify that there is a git project and it contains bin/wp-clone
+git_verify() {
+  local root
+  root=$(git rev-parse --show-toplevel)
+  if ! [ -e "${root}/bin/wp-clone" ]; then
+    >&2 echo "$(basename "$0"): unable to obtain project toplevel: $(pwd)"
+    exit 2
+  fi
+  verbose "git project root: ${root}"
+  cd "${root}"
+}
+
+# set the last used target in git config
+git_config_set_target() {
+  local dir="${1}"
+  git config --local --unset-all wp-clone.targets '^'"${dir}"'$' || true
+  git config --local --add wp-clone.targets "${dir}"
+}
+
+# get the last used target from git config, empty if not found
+git_config_get_target() {
+  git config --local --get wp-clone.targets
+}
+
+
+# echo verbose message
+verbose() {
+  if "${verbose}"; then
+    >&2 echo "${@}"
+  fi
+}
+
+show_usage() {
+cat <<EOD
+usage: wp-clone <source> [<target>]
+   or: wp-clone [-h|--help]
+   or: wp-clone [<options>] command [<options>]
+
+     <source>    ssh: host:directory
+     <target>    directory (will be created if it does not exists) to keep
+                 the clone locally to tinker with it.
+
+Common commands
+    switch <target>    switch to (existing) <target>
+    dc <*>...          run docker-compose command, db is the name
+                       of the database service (mysql) and wp is
+                       the name of the wordpress service (httpd +
+                       php)
+    xdebug [install]   install xdebug on the wp container
+
+Utility options
+    -h, --help         show usage instructions
+    -v, --verbose      output verbose messages
+
+EOD
+}
+
+# verify source string
+verify_or_die_source() {
+  if [[ ! ${1} = ?*:?* ]]; then
+    >&2 echo "invalid source: '${1}'"
+    exit 1
+  fi
+}
+
+# dc command: docker-compose
+cmd_dc() {
+  verbose "docker-compose:" "${@}"
+  dc "${@}"
+}
+# switch command: switch default target
+cmd_switch() {
+  local to_target="${1-}"
+  if [[ ! -e "${to_target}/.wp-sandbox/wp_clone_rc" ]]; then
+    >&2 echo "fatal: target \"${to_target}\" is not a target to switch to"
+    exit 1
+  fi
+  git_config_set_target "${to_target}"
+}
+
+verbose=false
+non_command_argument_counter=0
+command=
+
+while [[ $# -gt 0 ]]; do
+  key="${1}"
+  case "${key}" in
+    dc|switch) # commands
+      shift
+      command=${key}
+      break;
+      ;;
+    -h|--help) # help
+      show_usage
+      exit 0
+      ;;
+    -v|--verbose) # be verbose
+      verbose=true
+      shift
+      ;;
+    --) # end of options
+      if [ -z "${command}" ]; then
+        command=run
+      fi
+      break;
+      ;;
+    -*) # unknown long or short option
+      >&2 echo "$(basename "${0}"): unknown option: ${key}"
+      exit 1
+      ;;
+    *) # unknown argument
+      if [ -z "${command}" ]; then
+        command=run
+      fi
+      (( ++non_command_argument_counter ))
+      case "${non_command_argument_counter}" in
+        1)
+          verbose "setting source to '${key}' (reason: first non-command name matching argument)"
+          verify_or_die_source "${key}"
+          readonly source="${key}"
+          shift
+          ;;
+        2)
+          verbose "setting target to '${key}' (reason: second non-command name matching argument)"
+          readonly target="${key}"
+          shift
+          ;;
+        *)
+          >&2 echo "$(basename "${0}":) unknown argument #${non_command_argument_counter}: '${key}'"
+          exit 1
+          ;;
+      esac
+esac
+done
+
+verbose "command is '${command}' (after parsing options and arguments)"
+
+git_verify
+
+if [[ -z "${source+x}" ]]; then
+  test_target="$(git_config_get_target)"
+  if [[ -e "${test_target}/.wp-sandbox/wp_clone_rc" ]]; then
+    if [[ -z "${target+x}" ]]; then
+      readonly target="${test_target}"
+    fi
+    # shellcheck source=sites/example/.wp-sandbox/wp_clone_rc
+    source "${test_target}/.wp-sandbox/wp_clone_rc"
+  fi
+
+  if [[ -z "${source+x}" ]]; then
+    : # source not set, check last target, if set, take source from rc file which yet does not exists
+    >&2 echo "fatal: no source"
+    exit 2
+  fi
+else
+  : # source is set, this is fine
+fi
+
+readonly source_host="${source/:*/}"
+readonly source_path="${source/*:/}"
+[[ -z "${target+x}" ]] && readonly target="sites/${source_host}"
+readonly mysql_root_pw="somewordpress"
+
+init_target "${target}"
+git_config_set_target "${target}"
+
+case "${command}" in
+  dc)
+    cmd_dc "${@}"
+    exit
+    ;;
+  switch)
+    cmd_switch "${@}"
+    exit
+    ;;
+  run|'') # default command, fall-through intended
+    ;;
+  *)
+    >&2 echo "$(basename "${0}"): unknown command '${command}'"
+    exit 2
+esac
+
+readonly db_name="$(wpc DB_NAME)"
+ssh_init
+
+rsync_target
+ssh_mysql_dump
+
+dc_init
+dc up -d db
+dc_mysql_wait db
+import_dump
+
+readonly db_prefix="$(wpc_prefix)"
+
+readonly site_url="$(wpc_dcdb "siteurl")"
+echo "original site: ${site_url}"
+dc up -d --no-deps wp
+dc exec -T wp .wp-sandbox/extra-config.php
+dc exec -T wp /bin/sh -c '
+echo "installing xdebug-2.6.0..."
+pecl install xdebug-2.6.0 >/dev/null
+docker-php-ext-enable xdebug
+{
+  echo "xdebug.remote_enable = on"
+  echo "xdebug.remote_connect_back = 1"
+} >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
+'
+dc kill -s "USR1" wp
